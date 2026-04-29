@@ -87,9 +87,16 @@ try {
     # For the binary itself we bypass `gh release download` (no progress UI)
     # and use Invoke-WebRequest, which renders a native progress bar.
     # Auth via `gh auth token` preserves the same private-repo flow.
-    $AssetApiUrl = (& gh api "repos/$Repo/releases/tags/$Version" `
-        --jq "`.assets[] | select(.name == \`"$Asset\`") | .url`").Trim()
-    if (-not $AssetApiUrl) { Fail "Asset $Asset not found on release $Version." }
+    # Parse the release JSON in PowerShell rather than threading jq through
+    # PS quote-escaping (which was a source of bugs).
+    $ReleaseJson = (& gh api "repos/$Repo/releases/tags/$Version") -join "`n"
+    if ($LASTEXITCODE -ne 0 -or -not $ReleaseJson) {
+        Fail "Failed to query release $Version on $Repo (check network and gh authentication)."
+    }
+    $ReleaseObj   = $ReleaseJson | ConvertFrom-Json
+    $AssetObj     = $ReleaseObj.assets | Where-Object { $_.name -eq $Asset } | Select-Object -First 1
+    if (-not $AssetObj) { Fail "Asset $Asset not found on release $Version." }
+    $AssetApiUrl  = $AssetObj.url
 
     $GhToken = (& gh auth token).Trim()
     if (-not $GhToken) { Fail "Could not read gh token (gh auth token returned empty)." }
