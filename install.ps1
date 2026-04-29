@@ -137,7 +137,7 @@ try {
     # Copy-Item over an in-use braid.exe (which is exactly what happens
     # during `braid upgrade`) fails with "file in use". Standard self-update
     # pattern: rename the old binary out of the way first (Windows allows
-    # renaming a locked file — the rename only takes effect for new opens),
+    # renaming a locked file -- the rename only takes effect for new opens),
     # then copy the new binary into place. The renamed file lingers until
     # the running process exits, and we leave it for the next run to clean.
     if (Test-Path $DestPath) {
@@ -169,7 +169,7 @@ try {
         Write-Host "    [Environment]::SetEnvironmentVariable('Path', `"`$old;$InstallDir`", 'User')"
         Write-Host '  }'
         Write-Host ''
-        Write-Host "Then open a new terminal. (Avoid 'setx PATH' — it has a 1024-char limit and silently truncates long PATH values.)"
+        Write-Host "Then open a new terminal. (Avoid 'setx PATH' -- it has a 1024-char limit and silently truncates long PATH values.)"
     }
     Write-Host ''
     Write-Host 'Run: braid --version'
