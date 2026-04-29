@@ -54,7 +54,14 @@ if ($Version -eq 'latest') {
     }
 }
 
-if ($Version -notmatch '^v?[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$') {
+# Normalize to v-prefix. Release tags and asset names always carry the `v`
+# (e.g. `v0.5.0`, `braid-v0.5.0-windows-x64.exe`), but BRAID_VERSION accepts
+# both `v0.5.0` and `0.5.0` for ergonomics. Without this normalization, a bare
+# semver would ask gh for release "0.5.0" (404) and look for asset
+# "braid-0.5.0-..." (also missing).
+if ($Version -notmatch '^v') { $Version = "v$Version" }
+
+if ($Version -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$') {
     Fail "Resolved tag '$Version' is not a valid semver."
 }
 
@@ -66,14 +73,44 @@ $TmpDir = Join-Path ([System.IO.Path]::GetTempPath()) ("braid-install-" + [Syste
 New-Item -ItemType Directory -Force -Path $TmpDir | Out-Null
 
 try {
-    Write-Host "Downloading $Asset from $Repo@$Version..."
-    & gh release download $Version --repo $Repo -p $Asset -p 'SHA256SUMS' -D $TmpDir --clobber
-    if ($LASTEXITCODE -ne 0) { Fail "gh release download failed." }
+    # Two separate `gh release download` calls so the user gets useful
+    # progress: SHA256SUMS is instant, but the binary is ~120MB and takes
+    # a minute. A combined call only prints one status line and looks
+    # like a hang during the long binary fetch.
+    Write-Host "Fetching checksums from $Repo@$Version..."
+    & gh release download $Version --repo $Repo -p 'SHA256SUMS' -D $TmpDir --clobber
+    if ($LASTEXITCODE -ne 0) { Fail "gh release download (SHA256SUMS) failed." }
+
+    $SumsPath = Join-Path $TmpDir 'SHA256SUMS'
+    if (-not (Test-Path $SumsPath)) { Fail "SHA256SUMS not found on release $Version (cannot verify integrity)." }
+
+    # For the binary itself we bypass `gh release download` (no progress UI)
+    # and use Invoke-WebRequest, which renders a native progress bar.
+    # Auth via `gh auth token` preserves the same private-repo flow.
+    $AssetApiUrl = (& gh api "repos/$Repo/releases/tags/$Version" `
+        --jq "`.assets[] | select(.name == \`"$Asset\`") | .url`").Trim()
+    if (-not $AssetApiUrl) { Fail "Asset $Asset not found on release $Version." }
+
+    $GhToken = (& gh auth token).Trim()
+    if (-not $GhToken) { Fail "Could not read gh token (gh auth token returned empty)." }
 
     $AssetPath = Join-Path $TmpDir $Asset
-    $SumsPath  = Join-Path $TmpDir 'SHA256SUMS'
-    if (-not (Test-Path $AssetPath)) { Fail "Asset $Asset not found on release $Version." }
-    if (-not (Test-Path $SumsPath))  { Fail "SHA256SUMS not found on release $Version (cannot verify integrity)." }
+    Write-Host "Downloading $Asset..."
+    # Force the cmdlet's progress UI on even if the user shell suppresses it.
+    $prevProgress = $ProgressPreference
+    $ProgressPreference = 'Continue'
+    try {
+        Invoke-WebRequest -Uri $AssetApiUrl -OutFile $AssetPath -UseBasicParsing `
+            -Headers @{
+                Authorization = "Bearer $GhToken"
+                Accept        = 'application/octet-stream'
+            }
+    } finally {
+        $ProgressPreference = $prevProgress
+        Remove-Variable GhToken
+    }
+
+    if (-not (Test-Path $AssetPath)) { Fail "Download succeeded but $Asset is missing (unexpected)." }
 
     # --- Verify SHA256 ------------------------------------------------------
     Write-Host 'Verifying SHA256...'
@@ -87,16 +124,45 @@ try {
 
     # --- Install ------------------------------------------------------------
     New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-    Copy-Item -Force -Path $AssetPath -Destination (Join-Path $InstallDir $BinName)
+    $DestPath = Join-Path $InstallDir $BinName
+
+    # Windows holds an exclusive lock on running PE images, so a plain
+    # Copy-Item over an in-use braid.exe (which is exactly what happens
+    # during `braid upgrade`) fails with "file in use". Standard self-update
+    # pattern: rename the old binary out of the way first (Windows allows
+    # renaming a locked file — the rename only takes effect for new opens),
+    # then copy the new binary into place. The renamed file lingers until
+    # the running process exits, and we leave it for the next run to clean.
+    if (Test-Path $DestPath) {
+        $StaleSuffix = '.old-' + [System.Guid]::NewGuid().ToString('N')
+        try {
+            Rename-Item -Path $DestPath -NewName ($BinName + $StaleSuffix) -ErrorAction Stop
+        } catch {
+            Fail "Could not move existing $DestPath out of the way (is another braid process holding it?). $_"
+        }
+    }
+
+    # Best-effort cleanup of stale .old-* leftovers from prior upgrades.
+    Get-ChildItem -Path $InstallDir -Filter ($BinName + '.old-*') -ErrorAction SilentlyContinue |
+        ForEach-Object {
+            Remove-Item -Force -Path $_.FullName -ErrorAction SilentlyContinue
+        }
+
+    Copy-Item -Force -Path $AssetPath -Destination $DestPath
 
     Write-Host ''
     Write-Host "Installed $Version -> $(Join-Path $InstallDir $BinName)"
 
     if (-not (($env:PATH -split ';') -contains $InstallDir)) {
         Write-Host ''
-        Write-Host "Add $InstallDir to your PATH:"
-        Write-Host "  setx PATH `"`$env:PATH;$InstallDir`""
-        Write-Host '  (then open a new terminal)'
+        Write-Host "Add $InstallDir to your User PATH. Run this in a fresh PowerShell window:"
+        Write-Host ''
+        Write-Host "  `$old = [Environment]::GetEnvironmentVariable('Path', 'User')"
+        Write-Host "  if (-not (`$old -split ';' | Where-Object { `$_ -eq '$InstallDir' })) {"
+        Write-Host "    [Environment]::SetEnvironmentVariable('Path', `"`$old;$InstallDir`", 'User')"
+        Write-Host '  }'
+        Write-Host ''
+        Write-Host "Then open a new terminal. (Avoid 'setx PATH' — it has a 1024-char limit and silently truncates long PATH values.)"
     }
     Write-Host ''
     Write-Host 'Run: braid --version'
