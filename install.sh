@@ -202,15 +202,88 @@ install -m 0755 "$TMP_DIR/$ASSET" "$INSTALL_DIR/$BIN_NAME"
 
 printf '\nInstalled %s -> %s\n' "$VERSION" "$INSTALL_DIR/$BIN_NAME"
 
+# --- Ensure $INSTALL_DIR is on PATH ------------------------------------------
+# Try to append an export line to the user's shell rc file ourselves, matching
+# what `pulumi`, `claude`, and friends do — so a fresh `braid --version` in a
+# new terminal Just Works. Falls back to printing manual instructions only when
+# we can't identify the shell, can't write the file, or the user opts out via
+# BRAID_NO_MODIFY_PATH=1.
+add_to_path_unix() {
+	# Honor opt-out for users who manage PATH centrally (Nix home-manager,
+	# chezmoi, etc.) and don't want installers writing to their rc files.
+	if [ "${BRAID_NO_MODIFY_PATH:-0}" = "1" ]; then
+		return 1
+	fi
+
+	local install_dir="$1"
+	local shell_name rc_file line
+	shell_name="$(basename "${SHELL:-}")"
+
+	case "$shell_name" in
+		zsh)
+			rc_file="$HOME/.zshrc"
+			line="export PATH=\"$install_dir:\$PATH\""
+			;;
+		bash)
+			# macOS Terminal opens login shells (reads .bash_profile); Linux
+			# interactive shells read .bashrc. Pick the right one per OS.
+			if [ "$OS" = "darwin" ]; then
+				rc_file="$HOME/.bash_profile"
+			else
+				rc_file="$HOME/.bashrc"
+			fi
+			line="export PATH=\"$install_dir:\$PATH\""
+			;;
+		fish)
+			rc_file="$HOME/.config/fish/config.fish"
+			line="set -gx PATH \"$install_dir\" \$PATH"
+			;;
+		*)
+			# ksh, dash, busybox sh, unknown — bail out and let the user do it.
+			return 1
+			;;
+	esac
+
+	# Idempotence: if any line already mentions $install_dir (whether added by
+	# us, a previous install, or the user themselves), don't append again.
+	if [ -f "$rc_file" ] && grep -qF "$install_dir" "$rc_file" 2>/dev/null; then
+		PATH_RC_FILE="$rc_file"
+		PATH_RC_ALREADY=1
+		return 0
+	fi
+
+	mkdir -p "$(dirname "$rc_file")" 2>/dev/null || return 1
+	{
+		printf '\n# Added by braid installer\n'
+		printf '%s\n' "$line"
+	} >> "$rc_file" 2>/dev/null || return 1
+
+	PATH_RC_FILE="$rc_file"
+	PATH_RC_ALREADY=0
+	return 0
+}
+
 case ":$PATH:" in
-	*":$INSTALL_DIR:"*) ;;
+	*":$INSTALL_DIR:"*)
+		# Already on PATH for the current session — nothing to do.
+		;;
 	*)
-		printf '\nAdd %s to your PATH:\n' "$INSTALL_DIR"
-		# We want $PATH to remain literal in the printed command (the user
-		# copies it into their shell rc), so single quotes are intentional.
-		# shellcheck disable=SC2016
-		printf '  export PATH="%s:$PATH"\n' "$INSTALL_DIR"
-		printf '  # Append the line above to ~/.bashrc or ~/.zshrc to make it permanent.\n'
+		PATH_RC_FILE=""
+		PATH_RC_ALREADY=0
+		if add_to_path_unix "$INSTALL_DIR"; then
+			if [ "$PATH_RC_ALREADY" = "1" ]; then
+				printf '\n%s already references %s — open a new terminal to pick it up.\n' \
+					"$PATH_RC_FILE" "$INSTALL_DIR"
+			else
+				printf '\nAdded %s to PATH in %s.\n' "$INSTALL_DIR" "$PATH_RC_FILE"
+				printf 'Open a new terminal, or run: source %s\n' "$PATH_RC_FILE"
+			fi
+		else
+			printf '\nCould not auto-add %s to PATH. Add it manually:\n' "$INSTALL_DIR"
+			# shellcheck disable=SC2016
+			printf '  export PATH="%s:$PATH"\n' "$INSTALL_DIR"
+			printf '  # Append the line above to ~/.bashrc or ~/.zshrc to make it permanent.\n'
+		fi
 		;;
 esac
 

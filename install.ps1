@@ -160,16 +160,63 @@ try {
     Write-Host ''
     Write-Host "Installed $Version -> $(Join-Path $InstallDir $BinName)"
 
+    # --- Ensure InstallDir is on PATH ---------------------------------------
+    # Match `pulumi`, `claude`, etc. -- write the User PATH ourselves so a fresh
+    # PowerShell window finds braid without manual setup. Use the .NET API
+    # (not setx) because setx silently truncates PATH at 1024 chars.
+    # Honor BRAID_NO_MODIFY_PATH=1 for users who manage PATH centrally.
     if (-not (($env:PATH -split ';') -contains $InstallDir)) {
-        Write-Host ''
-        Write-Host "Add $InstallDir to your User PATH. Run this in a fresh PowerShell window:"
-        Write-Host ''
-        Write-Host "  `$old = [Environment]::GetEnvironmentVariable('Path', 'User')"
-        Write-Host "  if (-not (`$old -split ';' | Where-Object { `$_ -eq '$InstallDir' })) {"
-        Write-Host "    [Environment]::SetEnvironmentVariable('Path', `"`$old;$InstallDir`", 'User')"
-        Write-Host '  }'
-        Write-Host ''
-        Write-Host "Then open a new terminal. (Avoid 'setx PATH' -- it has a 1024-char limit and silently truncates long PATH values.)"
+        if ($env:BRAID_NO_MODIFY_PATH -eq '1') {
+            Write-Host ''
+            Write-Host "BRAID_NO_MODIFY_PATH=1 set -- skipping PATH update. Add $InstallDir to your User PATH manually."
+        }
+        else {
+            $pathUpdated = $false
+            $alreadyInUserPath = $false
+            try {
+                $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+                $userParts = if ($userPath) { $userPath -split ';' } else { @() }
+                if ($userParts -contains $InstallDir) {
+                    # Already persisted to the User PATH but not loaded in this
+                    # session (common when re-running the installer in the same
+                    # window after a prior install).
+                    $alreadyInUserPath = $true
+                }
+                else {
+                    $newPath = if ([string]::IsNullOrEmpty($userPath)) { $InstallDir } else { "$userPath;$InstallDir" }
+                    [Environment]::SetEnvironmentVariable('Path', $newPath, 'User')
+                }
+                # Update the running process so `braid` resolves immediately
+                # if the user keeps typing in the same window.
+                $env:PATH = "$env:PATH;$InstallDir"
+                $pathUpdated = $true
+            }
+            catch {
+                $pathUpdated = $false
+                $pathError = $_.Exception.Message
+            }
+
+            Write-Host ''
+            if ($pathUpdated) {
+                if ($alreadyInUserPath) {
+                    Write-Host "$InstallDir was already in your User PATH -- open a new terminal if it isn't picked up."
+                }
+                else {
+                    Write-Host "Added $InstallDir to your User PATH."
+                    Write-Host 'Open a new terminal for the change to take effect in new shells.'
+                }
+            }
+            else {
+                Write-Host "Could not auto-update PATH ($pathError). Add $InstallDir manually:"
+                Write-Host ''
+                Write-Host "  `$old = [Environment]::GetEnvironmentVariable('Path', 'User')"
+                Write-Host "  if (-not (`$old -split ';' | Where-Object { `$_ -eq '$InstallDir' })) {"
+                Write-Host "    [Environment]::SetEnvironmentVariable('Path', `"`$old;$InstallDir`", 'User')"
+                Write-Host '  }'
+                Write-Host ''
+                Write-Host "Then open a new terminal. (Avoid 'setx PATH' -- it has a 1024-char limit and silently truncates long PATH values.)"
+            }
+        }
     }
     Write-Host ''
     Write-Host 'Run: braid --version'
