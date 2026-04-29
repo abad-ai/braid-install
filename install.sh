@@ -54,6 +54,39 @@ case "$UNAME_M" in
 		;;
 esac
 
+# Bun's `bun-linux-*` cross-compile targets are glibc-linked. On musl-based
+# distros (Alpine and friends) the binary downloads and SHA-verifies cleanly
+# but fails at runtime with a confusing dynamic-loader error. Detect musl up
+# front so the failure mode is "we don't ship a binary for your distro" rather
+# than "your install seemed to work but braid won't start."
+if [ "$OS" = "linux" ]; then
+	# `ldd --version` writes "musl libc" on musl, "GNU libc"/"GLIBC" on glibc.
+	# It exits non-zero on musl (intentional), so check both stdout+stderr and
+	# don't fail the script on the non-zero exit.
+	LDD_OUT="$( (ldd --version 2>&1) || true )"
+	IS_MUSL=0
+	if printf '%s' "$LDD_OUT" | grep -qi 'musl'; then
+		IS_MUSL=1
+	fi
+	# Defense-in-depth: minimal containers (busybox, distroless) may lack
+	# `ldd` entirely, in which case the grep above can silently miss musl.
+	# The presence of the musl dynamic loader at /lib/ld-musl-* is the
+	# canonical signal regardless of whether ldd exists.
+	for ld in /lib/ld-musl-*; do
+		if [ -e "$ld" ]; then
+			IS_MUSL=1
+			break
+		fi
+	done
+	if [ "$IS_MUSL" = "1" ]; then
+		err "Detected musl libc (Alpine, etc.). Braid binaries are glibc-only."
+		err "Workarounds:"
+		err "  - install on a glibc distro (Ubuntu, Debian, Fedora, etc.)"
+		err "  - or build from source: https://github.com/abad-ai/braid"
+		exit 1
+	fi
+fi
+
 # --- Resolve & validate version ---------------------------------------------
 VERSION="${BRAID_VERSION:-latest}"
 
@@ -73,9 +106,19 @@ if [ "$VERSION" = "latest" ]; then
 	fi
 fi
 
+# Normalize to v-prefix. Release tags and asset names always carry the `v`
+# (e.g. `v0.5.0`, `braid-v0.5.0-linux-x64`), but BRAID_VERSION accepts both
+# `v0.5.0` and `0.5.0` for ergonomics. Without normalization, a bare semver
+# would ask gh for release "0.5.0" (404) and look for asset "braid-0.5.0-..."
+# (also missing).
+case "$VERSION" in
+	v*) ;;
+	*) VERSION="v$VERSION" ;;
+esac
+
 # Re-validate the resolved tag (defense-in-depth — gh output is trusted, but
 # this also catches accidental empty/garbage responses).
-if ! printf '%s' "$VERSION" | grep -Eq '^v?[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$'; then
+if ! printf '%s' "$VERSION" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$'; then
 	err "Resolved tag '$VERSION' is not a valid semver."
 	exit 1
 fi
@@ -87,20 +130,51 @@ TMP_DIR="$(mktemp -d)"
 cleanup() { rm -rf "$TMP_DIR"; }
 trap cleanup EXIT
 
-printf 'Downloading %s from %s@%s...\n' "$ASSET" "$REPO" "$VERSION"
+# Two separate `gh release download` calls so the user gets useful
+# progress: the SHA256SUMS download is instant, but the binary is ~100MB
+# and takes a noticeable amount of time. A combined call would only print
+# one status line and look like a hang during the long binary fetch.
+printf 'Fetching checksums from %s@%s...\n' "$REPO" "$VERSION"
 gh release download "$VERSION" \
 	--repo "$REPO" \
-	-p "$ASSET" \
 	-p "SHA256SUMS" \
 	-D "$TMP_DIR" \
-	--clobber
+	--clobber \
+	|| { err "Failed to download SHA256SUMS from $REPO@$VERSION (check network and gh authentication)."; exit 1; }
 
-if [ ! -f "$TMP_DIR/$ASSET" ]; then
+if [ ! -f "$TMP_DIR/SHA256SUMS" ]; then
+	err "SHA256SUMS not found on release $VERSION (cannot verify integrity)."
+	exit 1
+fi
+
+# For the binary itself we bypass `gh release download` (which has no
+# progress UI) and use curl with --progress-bar. Auth via `gh auth token`
+# preserves the same private-repo flow. Asset URL comes from the same
+# release lookup `gh release download` would do internally.
+ASSET_API_URL="$(gh api "repos/$REPO/releases/tags/$VERSION" \
+	--jq ".assets[] | select(.name == \"$ASSET\") | .url")" \
+	|| { err "Failed to query release assets for $REPO@$VERSION (check network and gh authentication)."; exit 1; }
+if [ -z "$ASSET_API_URL" ]; then
 	err "Asset $ASSET not found on release $VERSION."
 	exit 1
 fi
-if [ ! -f "$TMP_DIR/SHA256SUMS" ]; then
-	err "SHA256SUMS not found on release $VERSION (cannot verify integrity)."
+
+GH_TOKEN_FOR_DOWNLOAD="$(gh auth token 2>/dev/null)"
+if [ -z "$GH_TOKEN_FOR_DOWNLOAD" ]; then
+	err "Could not read gh token (gh auth token returned empty)."
+	exit 1
+fi
+
+printf 'Downloading %s...\n' "$ASSET"
+curl --fail --location --progress-bar \
+	-H "Authorization: Bearer $GH_TOKEN_FOR_DOWNLOAD" \
+	-H "Accept: application/octet-stream" \
+	-o "$TMP_DIR/$ASSET" \
+	"$ASSET_API_URL"
+unset GH_TOKEN_FOR_DOWNLOAD
+
+if [ ! -f "$TMP_DIR/$ASSET" ]; then
+	err "Download succeeded but $ASSET is missing in $TMP_DIR (unexpected)."
 	exit 1
 fi
 
