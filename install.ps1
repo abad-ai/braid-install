@@ -1,4 +1,4 @@
-# install.ps1 — Windows installer for the Braid CLI.
+# install.ps1 -- Windows installer for the Braid CLI.
 #
 # Source repo abad-ai/braid is private, so this script uses `gh` to download
 # release assets. The user must have `gh` installed and authenticated against
@@ -10,6 +10,14 @@
 # Env vars:
 #   BRAID_VERSION  release tag to install (default: latest)
 #   BRAID_REPO     source repo (default: abad-ai/braid)
+
+# Write-Host is intentional for user-facing output in this interactive
+# installer -- output should go directly to the host, not the pipeline.
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+    'PSAvoidUsingWriteHost', '',
+    Justification = 'Interactive installer: Write-Host is the right choice for user-facing messages that should not enter the pipeline.'
+)]
+param()
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'

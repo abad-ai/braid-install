@@ -132,6 +132,9 @@ case ":$PATH:" in
 	*":$INSTALL_DIR:"*) ;;
 	*)
 		printf '\nAdd %s to your PATH:\n' "$INSTALL_DIR"
+		# We want $PATH to remain literal in the printed command (the user
+		# copies it into their shell rc), so single quotes are intentional.
+		# shellcheck disable=SC2016
 		printf '  export PATH="%s:$PATH"\n' "$INSTALL_DIR"
 		printf '  # Append the line above to ~/.bashrc or ~/.zshrc to make it permanent.\n'
 		;;
